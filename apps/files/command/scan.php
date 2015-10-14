@@ -31,6 +31,7 @@ use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Helper\Table;
 
 class Scan extends Command {
 
@@ -38,6 +39,15 @@ class Scan extends Command {
 	 * @var \OC\User\Manager $userManager
 	 */
 	private $userManager;
+	/** @var float */
+	protected $execTime = 0;
+	/** @var int */
+	protected $foldersCounter = 0;
+	/** @var int */
+	protected $filesCounter = 0;
+	/** @var bool */
+	protected $interrupted = false;
+
 
 	public function __construct(\OC\User\Manager $userManager) {
 		$this->userManager = $userManager;
@@ -76,13 +86,31 @@ class Scan extends Command {
 	protected function scanFiles($user, $path, $quiet, OutputInterface $output) {
 		$scanner = new \OC\Files\Utils\Scanner($user, \OC::$server->getDatabaseConnection());
 		if (!$quiet) {
-			$scanner->listen('\OC\Files\Utils\Scanner', 'scanFile', function ($path) use ($output) {
-				$output->writeln("Scanning file   <info>$path</info>");
-			});
-			$scanner->listen('\OC\Files\Utils\Scanner', 'scanFolder', function ($path) use ($output) {
-				$output->writeln("Scanning folder <info>$path</info>");
-			});
+			$scanner->listen('\OC\Files\Utils\Scanner', 'scanFile',
+				function ($path) use ($output) {
+					$output->writeln("Scanning file   <info>$path</info>");
+					$this->filesCounter += 1;
+					$this->checkForInterruption($output);
+				});
+			$scanner->listen('\OC\Files\Utils\Scanner', 'scanFolder', 
+				function ($path) use ($output) {
+					$output->writeln("Scanning folder <info>$path</info>");
+					$this->foldersCounter += 1;
+					$this->checkForInterruption($output);
+				});
+		} else {
+			$scanner->listen('\OC\Files\Utils\Scanner', 'scanFile', 
+				function ($path) use ($output) { 
+					$this->filesCounter += 1;
+					$this->checkForInterruption($output);
+				});
+			$scanner->listen('\OC\Files\Utils\Scanner', 'scanFolder', 
+				function ($path) use ($output) {
+					$this->foldersCounter += 1;
+					$this->checkForInterruption($output);
+				});
 		}
+
 		try {
 			$scanner->scan($path);
 		} catch (ForbiddenException $e) {
@@ -91,6 +119,7 @@ class Scan extends Command {
 		}
 	}
 
+	
 	protected function execute(InputInterface $input, OutputInterface $output) {
 		$inputPath = $input->getOption('path');
 		if ($inputPath) {
@@ -104,11 +133,12 @@ class Scan extends Command {
 		}
 		$quiet = $input->getOption('quiet');
 
-
 		if (count($users) === 0) {
 			$output->writeln("<error>Please specify the user id to scan, \"--all\" to scan for all users or \"--path=...\"</error>");
 			return;
 		}
+
+		$this->initTools();
 
 		foreach ($users as $user) {
 			if (is_object($user)) {
@@ -121,5 +151,138 @@ class Scan extends Command {
 				$output->writeln("<error>Unknown user $user</error>");
 			}
 		}
+
+		# if quiet mode has been set to surpress the printout of files and directories beeing
+		# currently processed, set verbosity back to normal to enable the printout of the statistics
+		if ($quiet) {
+			$output->setVerbosity(OutputInterface::VERBOSITY_NORMAL);
+		}
+
+		$this->presentResults($output);
 	}
+
+
+	/**
+	 * Checks if the command was interrupted by ctrl-c
+	 */
+	protected function checkForInterruption($output) {
+		if ($this->hasBeenInterrupted()) {
+			$this->presentResults($output);
+			exit;
+		}
+	}
+
+
+	/**
+	 * Initialises some useful tools for the Command
+	 */
+	protected function initTools() {
+		// Start the timer
+		$this->execTime = -microtime(true);
+		// Convert PHP errors to exceptions
+		set_error_handler([$this, 'exceptionErrorHandler'], E_ALL);
+
+		// Collect interrupts and notify the running command
+		pcntl_signal(SIGTERM, [$this, 'cancelOperation']);
+		pcntl_signal(SIGINT, [$this, 'cancelOperation']);
+	}
+
+
+	/**
+	 * Changes the status of the command to "interrupted"
+	 *
+	 * Gives a chance to the command to properly terminate what it's doing
+	 */
+	private function cancelOperation() {
+		$this->interrupted = true;
+	}
+
+
+	/**
+	 * Processes PHP errors as exceptions in order to be able to keep track of problems
+	 *
+	 * @see https://secure.php.net/manual/en/function.set-error-handler.php
+	 *
+	 * @param int $severity the level of the error raised
+	 * @param string $message
+	 * @param string $file the filename that the error was raised in
+	 * @param int $line the line number the error was raised
+	 *
+	 * @throws \ErrorException
+	 */
+	public function exceptionErrorHandler($severity, $message, $file, $line) {
+		if (!(error_reporting() & $severity)) {
+			// This error code is not included in error_reporting
+			return;
+		}
+		throw new \ErrorException($message, 0, $severity, $file, $line);
+	}
+
+
+	/**
+	 * @return bool
+	 */
+	protected function hasBeenInterrupted() {
+		$cancelled = false;
+		pcntl_signal_dispatch();
+		if ($this->interrupted) {
+			$cancelled = true;
+		}
+
+		return $cancelled;
+	}
+
+
+	/**
+	 * @param OutputInterface $output
+	 */
+	protected function presentResults(OutputInterface $output) {
+		// Stop the timer
+		$this->execTime += microtime(true);
+		$output->writeln("");
+
+		$headers = [
+			'Folders', 'Files', 'Elapsed time'
+		];
+
+		$this->showSummary($headers, null, $output);
+	}
+
+
+	/**
+	 * Shows a summary of operations
+	 *
+	 * @param string[] $headers
+	 * @param string[] $rows
+	 * @param OutputInterface $output
+	 */
+	protected function showSummary($headers, $rows, OutputInterface $output) {
+		$niceDate = $this->formatExecTime();
+		if (!$rows) {
+			$rows = [
+				$this->foldersCounter,
+				$this->filesCounter,
+				$niceDate,
+			];
+		}
+		$table = new Table($output);
+		$table
+			->setHeaders($headers)
+			->setRows([$rows]);
+		$table->render();
+	}
+
+
+	/**
+	 * Formats microtime into a human readable format
+	 *
+	 * @return string
+	 */
+	protected function formatExecTime() {
+		list($secs, $tens) = explode('.', sprintf("%.1f", ($this->execTime)));
+		$niceDate = date('H:i:s', $secs) . '.' . $tens;
+
+		return $niceDate;
+	}
+
 }
